@@ -31,6 +31,8 @@ from configuration import BertJobConfiguration
 
 from azureml.core.run import Run
 
+from apex import amp
+import time
 
 def get_effective_batch(total):
     if use_multigpu_with_single_device_per_process:
@@ -127,6 +129,10 @@ def train(index):
     sequences_counter = 0
     global_step_loss = 0
 
+    st = time.time()
+    batch_loss = 0
+    epoch_start_time = time.time()
+
     for step, dataset_type in enumerate(dataset_picker):
         try:
             batch = next(dataloaders[dataset_type])
@@ -149,46 +155,83 @@ def train(index):
             if gradient_accumulation_steps > 1:
                 loss = loss / gradient_accumulation_steps
 
-            # Enabling  optimized Reduction
-            # reduction only happens in backward if this method is called before
-            # when using the distributed module
-            if accumulate_gradients:
-                if use_multigpu_with_single_device_per_process and (step + 1) % gradient_accumulation_steps == 0:
-                    model.network.enable_need_reduction()
-                else:
-                    model.network.disable_need_reduction()
-            if fp16:
-                optimizer.backward(loss)
-            else:
-                loss.backward()
+            # # Enabling  optimized Reduction
+            # # reduction only happens in backward if this method is called before
+            # # when using the distributed module
+            # if accumulate_gradients:
+            #     if use_multigpu_with_single_device_per_process and (step + 1) % gradient_accumulation_steps == 0:
+            #         model.network.enable_need_reduction()
+            #     else:
+            #         model.network.disable_need_reduction()
+            # if fp16:
+            #     optimizer.backward(loss)
+            # else:
+            #     loss.backward()
 
-            global_step_loss += loss
-            if (step + 1) % gradient_accumulation_steps == 0:
-                if fp16:
-                    # modify learning rate with special warm up BERT uses
-                    # if fp16 is False, BertAdam is used that handles this automatically
-                    lr_this_step = \
-                        job_config.get_learning_rate() * warmup_linear_decay_exp(global_step,
-                                                                                 job_config.get_decay_rate(),
-                                                                                 job_config.get_decay_step(),
-                                                                                 job_config.get_total_training_steps(),
-                                                                                 job_config.get_warmup_proportion())
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr_this_step
+            # global_step_loss += loss
+            # if (step + 1) % gradient_accumulation_steps == 0:
+            #     if fp16:
+            #         # modify learning rate with special warm up BERT uses
+            #         # if fp16 is False, BertAdam is used that handles this automatically
+            #         lr_this_step = \
+            #             job_config.get_learning_rate() * warmup_linear_decay_exp(global_step,
+            #                                                                      job_config.get_decay_rate(),
+            #                                                                      job_config.get_decay_step(),
+            #                                                                      job_config.get_total_training_steps(),
+            #                                                                      job_config.get_warmup_proportion())
+            #         for param_group in optimizer.param_groups:
+            #             param_group['lr'] = lr_this_step
 
-                    # Record the LR against global_step on tensorboard
-                    if check_write_log():
-                        summary_writer.add_scalar(f'Train/lr', lr_this_step, global_step)
+            #         # Record the LR against global_step on tensorboard
+            #         if check_write_log():
+            #             summary_writer.add_scalar(f'Train/lr', lr_this_step, global_step)
                     
-                optimizer.step()
+            #     optimizer.step()
+            #     optimizer.zero_grad()
+            #     global_step += 1
+            #     if check_write_log() and (global_step%args.log_steps == 0):
+            #         run.log("training_loss", np.float(global_step_loss))
+            #         run.log("lr_this_step", np.float(lr_this_step))
+            #         run.log_row("loss over steps", global_step = global_step, loss =  np.float(global_step_loss))
+            #         run.log_row("lr over steps", global_step = global_step, lr  = np.float(lr_this_step))
+            #     global_step_loss = 0
+
+            # keep track of batch loss over gradient accumulation steps
+            batch_loss += loss.item()
+
+            if (step + 1) % gradient_accumulation_steps == 0:
+                lr_this_step = \
+                               job_config.get_learning_rate() * warmup_linear_decay_exp(global_step,
+                                                                                        job_config.get_decay_rate(),
+                                                                                        job_config.get_decay_step(),
+                                                                                        job_config.get_total_training_steps(),
+                                                                                        job_config.get_warmup_proportion())
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_this_step
+
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                    optimizer.synchronize()
+
+                total_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 1.0)
+
+                with optimizer.skip_synchronize():
+                    optimizer.step()
+
                 optimizer.zero_grad()
                 global_step += 1
-                if check_write_log() and (global_step%args.log_steps == 0):
-                    run.log("training_loss", np.float(global_step_loss))
-                    run.log("lr_this_step", np.float(lr_this_step))
-                    run.log_row("loss over steps", global_step = global_step, loss =  np.float(global_step_loss))
-                    run.log_row("lr over steps", global_step = global_step, lr  = np.float(lr_this_step))
-                global_step_loss = 0
+
+                ed = time.time()
+
+                if check_write_log():
+                    print("training_loss: {} {} {} {} {}".format(global_step, lr_this_step, total_norm, batch_loss, ed - st), flush=True)
+
+                batch_loss = 0
+                st = time.time()
+            else:
+                with amp.scale_loss(loss, optimizer, delay_unscale=True) as scaled_loss:
+                    scaled_loss.backward()
+
         except StopIteration:
             continue
         
@@ -406,8 +449,8 @@ if __name__ == '__main__':
                           summary_writer = summary_writer)
 
     logger.info("Converting the input parameters")
-    if fp16:
-        model.half()
+    #if fp16:
+    #    model.half()
         
     model.to(device)
 
@@ -441,19 +484,33 @@ if __name__ == '__main__':
 
     if fp16:
         try:
-            from apex.optimizers import FP16_Optimizer, FusedAdam
+            #from apex.optimizers import FP16_Optimizer, FusedAdam
+            from apex.optimizers import FusedLAMB
         except:
-            raise ImportError("To use distributed and fp16 training, please install apex from the branch bertonazureml/apex at https://www.github.com/microsoft/apex.")
+            #raise ImportError("To use distributed and fp16 training, please install apex from the branch bertonazureml/apex at https://www.github.com/microsoft/apex.")
+            raise ImportError("Error importing optimizer!!!")
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=job_config.get_learning_rate(),
-                              bias_correction=False,
-                              max_grad_norm=1.0)
+        #optimizer = FusedAdam(optimizer_grouped_parameters,
+        #                      lr=job_config.get_learning_rate(),
+        #                      bias_correction=False,
+        #                      max_grad_norm=1.0)
+
+        optimizer = FusedLAMB(optimizer_grouped_parameters,
+                              #lr=job_config.get_learning_rate(),
+                              lr=4e-3,
+                              bias_correction=False
+                              #t_total=job_config.get_total_training_steps()
+                              )
+
         if loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            #optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", loss_scale="dynamic",
+                                              master_weights=False if accumulate_gradients else True)
         else:
-            optimizer = FP16_Optimizer(
-                optimizer, static_loss_scale=loss_scale)
+            #optimizer = FP16_Optimizer(
+            #    optimizer, static_loss_scale=loss_scale)
+            model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", loss_scale=loss_scale,
+                                              master_weights=False if accumulate_gradients else True)
     else:
         optimizer = BertAdam(optimizer_grouped_parameters,
                              lr=job_config.get_learning_rate(),
